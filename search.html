@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="en" dir="ltr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sandstorm Search</title>
+  <style>
+    *{box-sizing:border-box}
+    body{margin:0;min-height:100vh;padding:28px 16px;background:linear-gradient(135deg,#f3ede2,#e7decb);color:#4a3e3d;font-family:system-ui,-apple-system,sans-serif}
+    .container{max-width:760px;margin:40px auto;background:#fffdf9;padding:28px 24px;border-radius:16px;box-shadow:0 12px 40px #87785f26;border:1px solid #e8dec9}
+    h1{font-size:26px;color:#705e49;margin:0 0 16px}
+    .status{color:#8c7b64;margin:0 0 16px;font-size:14px}
+    input{width:100%;padding:14px 16px;margin-bottom:18px;border:1px solid #d9ccb4;border-radius:10px;font-size:16px;background:#faf7f0;color:#4a3e3d}
+    input:focus{outline:2px solid #bfae93;outline-offset:1px}
+    table{width:100%;border-collapse:collapse;margin-top:8px}
+    th,td{border:1px solid #ebdcb9;padding:13px 14px;text-align:left;overflow-wrap:anywhere}
+    th{background:#efe6cf;color:#61503b;font-size:13px;text-transform:uppercase}
+    tbody{display:table-row-group;visibility:visible}
+    tbody tr{display:table-row;cursor:pointer;background:#fffdf9}
+    tbody td{display:table-cell;min-height:48px;height:auto;color:#4a3e3d;background:#fffdf9;line-height:1.5;vertical-align:top}
+    tbody tr:hover td{background:#f3ebda}
+    .empty{color:#8c7b64;text-align:center;cursor:default}
+    .result-title{display:block;color:#4a3e3d;font-weight:600;overflow-wrap:anywhere;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:3;overflow:hidden;line-height:1.45;max-height:4.35em}
+    .result-url{display:block;color:#8c7b64;font-size:12px;margin-top:5px;overflow-wrap:anywhere}
+    .result-link{color:inherit;text-decoration:none;display:block}
+    .result-link:hover .result-title{text-decoration:underline}
+    @media(max-width:480px){.container{margin:8px auto;padding:20px 14px}h1{font-size:23px}}
+  </style>
+</head>
+<body>
+  <main class="container">
+    <h1>Sandstorm Search</h1>
+    <p id="status" class="status" role="status">Connecting to the search database…</p>
+    <form id="searchForm">
+      <input id="searchInput" type="search" placeholder="Type a search and press Enter…" aria-label="Search data" autocomplete="off">
+    </form>
+    <table>
+      <thead><tr><th>Search results</th></tr></thead>
+      <tbody id="tableBody"></tbody>
+    </table>
+  </main>
+<script>
+  // Hugging Face dataset containing gzip-compressed CSV database files.
+  const DATASET_ID = 'infinity-non-comercial/sandstormsearchdatabase';
+  const HF_API = 'https://huggingface.co/api/datasets/' + DATASET_ID;
+  const HF_FILES = 'https://huggingface.co/datasets/' + DATASET_ID + '/resolve/main/';
+
+  const searchInput = document.getElementById('searchInput');
+  const searchForm = document.getElementById('searchForm');
+  const statusEl = document.getElementById('status');
+  const tableBody = document.getElementById('tableBody');
+  let searchRecords = [];
+  let loadedFiles = 0;
+  let totalFiles = 0;
+  let loadErrors = 0;
+  let cacheStore = null;
+
+  function getQueryParameter() {
+    const params = new URLSearchParams(window.location.search);
+    for (const [key, value] of params.entries()) {
+      if (key.toLowerCase() === 'q' && value.trim()) return value.trim();
+    }
+    return '';
+  }
+
+  function setStatus(message, isError = false) {
+    statusEl.textContent = message;
+    statusEl.style.color = isError ? '#b33939' : '#8c7b64';
+  }
+
+  function parseCSV(text) {
+    const rows = [];
+    let row = [], cell = '', quoted = false;
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i];
+      if (ch === '"') {
+        if (quoted && text[i + 1] === '"') { cell += '"'; i++; }
+        else quoted = !quoted;
+      } else if (ch === ',' && !quoted) {
+        row.push(cell.trim()); cell = '';
+      } else if ((ch === '\n' || ch === '\r') && !quoted) {
+        if (ch === '\r' && text[i + 1] === '\n') i++;
+        row.push(cell.trim()); cell = '';
+        if (row.some(value => value !== '')) rows.push(row);
+        row = [];
+      } else {
+        cell += ch;
+      }
+    }
+    row.push(cell.trim());
+    if (row.some(value => value !== '')) rows.push(row);
+    return rows;
+  }
+
+  function extractUrl(row) {
+    for (const value of row) {
+      const match = value.match(/https?:\/\/[^\s"'<>|,]+/i);
+      if (match) {
+        try {
+          const url = new URL(match[0]);
+          if (url.protocol === 'http:' || url.protocol === 'https:') return url.href;
+        } catch (_) {}
+      }
+    }
+    return '';
+  }
+
+  function indexCsv(csvText, source) {
+    const rows = parseCSV(csvText);
+    if (!rows.length) return;
+
+    // Skip a header row when the file has multiple rows, matching the old CSV behavior.
+    const dataRows = rows.length > 1 ? rows.slice(1) : rows;
+    for (const row of dataRows) {
+      const url = extractUrl(row);
+      const text = row
+        .filter(value => !/https?:\/\//i.test(value))
+        .join(' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (text || url) {
+        const displayText = text || url;
+        searchRecords.push({ text: displayText, searchText: (displayText + ' ' + url).toLocaleLowerCase(), url, source });
+      }
+    }
+  }
+
+  async function decompressGzip(buffer) {
+    if (typeof DecompressionStream === 'undefined') {
+      throw new Error('This browser does not support gzip decompression. Please use a recent version of Chrome, Edge, Firefox or Safari.');
+    }
+    const stream = new Blob([buffer]).stream().pipeThrough(new DecompressionStream('gzip'));
+    return await new Response(stream).text();
+  }
+
+  function encodeRepoPath(path) {
+    return path.split('/').map(encodeURIComponent).join('/');
+  }
+
+  async function loadOneFile(file) {
+    const url = HF_FILES + encodeRepoPath(file);
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(file + ' (HTTP ' + response.status + ')');
+    const compressed = await response.arrayBuffer();
+    const csvText = await decompressGzip(compressed);
+    indexCsv(csvText, url);
+    loadedFiles++;
+    setStatus('Loaded ' + loadedFiles + ' of ' + totalFiles + ' files · ' + searchRecords.length.toLocaleString() + ' records' + (loadErrors ? ' · ' + loadErrors + ' errors' : '') + '.');
+    if (searchInput.value.trim()) filterData();
+  }
+
+  async function loadDatabase() {
+    setStatus('Getting the list of database files from Hugging Face…');
+    if ('caches' in window) {
+      try { cacheStore = await caches.open('sandstorm-search-database-v2'); } catch (_) {}
+    }
+    const response = await fetch(HF_API, { headers: { Accept: 'application/json' }, cache: 'no-cache' });
+    if (!response.ok) throw new Error('Could not access the Hugging Face dataset (HTTP ' + response.status + ').');
+    const metadata = await response.json();
+    const files = (metadata.siblings || [])
+      .map(item => item.rfilename)
+      .filter(name => typeof name === 'string' && name.toLowerCase().endsWith('.gz'));
+
+    if (!files.length) throw new Error('No .gz files were found in the Hugging Face dataset.');
+
+    totalFiles = files.length;
+    setStatus('Found ' + totalFiles + ' compressed files. Downloading and decompressing CSV data…');
+
+    let nextIndex = 0;
+    const workerCount = Math.min(8, files.length);
+    const errors = [];
+    async function worker() {
+      while (nextIndex < files.length) {
+        const index = nextIndex++;
+        try {
+          await loadOneFile(files[index]);
+        } catch (error) {
+          loadErrors++;
+          errors.push(files[index] + ': ' + (error.message || String(error)));
+        }
+      }
+    }
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
+
+    if (!searchRecords.length) {
+      throw new Error(errors.length
+        ? 'The .gz files were found, but no searchable CSV records could be loaded. First error: ' + errors[0]
+        : 'The decompressed CSV files did not contain searchable records.');
+    }
+
+    const suffix = errors.length ? ' (' + errors.length + ' files could not be loaded)' : '';
+    setStatus('Search database ready: ' + loadedFiles + '/' + totalFiles + ' files, ' + searchRecords.length + ' searchable records' + suffix + '.');
+    if (searchInput.value.trim()) filterData();
+    else showResults([]);
+  }
+
+  function showResults(results) {
+    const fragment = document.createDocumentFragment();
+    if (!results.length) {
+      const tr = document.createElement('tr');
+      const td = document.createElement('td');
+      td.colSpan = 1;
+      td.className = 'empty';
+      td.textContent = searchInput.value.trim() ? 'No matching results found.' : 'Enter a search term to begin.';
+      tr.appendChild(td);
+      fragment.appendChild(tr);
+    } else {
+      for (const result of results.slice(0, 100)) {
+        const tr = document.createElement('tr');
+        const td = document.createElement('td');
+        const title = document.createElement('span');
+        title.className = 'result-title';
+        title.textContent = result.text || result.url || 'Untitled result';
+        if (result.url) {
+          const link = document.createElement('a');
+          link.className = 'result-link';
+          link.href = result.url;
+          link.target = '_blank';
+          link.rel = 'noopener noreferrer';
+          link.appendChild(title);
+          td.appendChild(link);
+          const address = document.createElement('span');
+          address.className = 'result-url';
+          address.textContent = result.url;
+          td.appendChild(address);
+        } else {
+          td.appendChild(title);
+        }
+        tr.appendChild(td);
+        fragment.appendChild(tr);
+      }
+    }
+    tableBody.replaceChildren(fragment);
+    tableBody.style.display = 'table-row-group';
+    tableBody.style.visibility = 'visible';
+  }
+
+  function filterData() {
+    const query = searchInput.value.trim().toLocaleLowerCase();
+    if (!query) {
+      showResults([]);
+      setStatus('Search database ready: ' + searchRecords.length + ' searchable records.');
+      return;
+    }
+    const terms = query.split(/\s+/).filter(Boolean);
+    const results = searchRecords.filter(record => {
+      return terms.every(term => record.searchText.includes(term));
+    });
+    showResults(results);
+    setStatus(results.length + ' matching result' + (results.length === 1 ? '' : 's') + '.');
+  }
+
+  searchForm.addEventListener('submit', event => {
+    event.preventDefault();
+    const url = new URL(window.location.href);
+    const query = searchInput.value.trim();
+    for (const key of Array.from(url.searchParams.keys())) {
+      if (key.toLowerCase() === 'q') url.searchParams.delete(key);
+    }
+    if (query) url.searchParams.set('q', query);
+    window.history.replaceState({}, '', url);
+    filterData();
+  });
+
+  searchInput.value = getQueryParameter();
+  loadDatabase().catch(error => {
+    setStatus(error.message || 'Could not load the search database.', true);
+  });
+</script>
+  <a href="https://github.com/otizemlanetzag/sandstorm_search">github</a>
+</body>
+</html>
